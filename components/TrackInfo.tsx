@@ -1,3 +1,4 @@
+import Image from "next/image";
 import { Music, X } from "lucide-react";
 import { TrackInfo as TrackInfoType } from "@/types/track";
 
@@ -27,10 +28,13 @@ export default function TrackInfo({
     <div className="mt-6 p-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg border border-gray-200 dark:border-gray-600">
       <div className="flex items-start gap-4">
         {trackInfo.artwork_url && (
-          <img
+          <Image
             src={trackInfo.artwork_url}
             alt={trackInfo.title}
+            width={96}
+            height={96}
             className="w-24 h-24 rounded-lg object-cover"
+            unoptimized
           />
         )}
         <div className="flex-1">
