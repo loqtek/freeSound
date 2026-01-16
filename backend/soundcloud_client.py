@@ -16,6 +16,8 @@ class SoundCloudClient:
     CLIENT_IDS = [
         "xXKzFLdhfXAtbaLbKFp4cNoiduLizuYO",
         "LvWovRaZq8q5f1Z2K0t1Y7v5fJ8xK9pL",
+        "dH1Xed1fpITYonugor6sw39jvdq58M3h",
+        "02gUJC0hH2ct1EGOcYXQIzRFU91c72Ea",
     ]
     
     # User-Agent string for HTTP requests
@@ -40,45 +42,98 @@ class SoundCloudClient:
         )
         self.client_id: Optional[str] = None
     
-    async def get_client_id(self) -> str:
-        """Extract client ID from SoundCloud's main page."""
-        if self.client_id:
-            return self.client_id
-        
+    async def _extract_client_ids_from_js_bundles(self) -> List[str]:
+        """Extract client IDs from SoundCloud's JavaScript bundles (more reliable)."""
+        found_ids = []
         try:
+            # Get main page
             response = await self.client.get("https://soundcloud.com")
             response.raise_for_status()
+            html_content = response.text
             
-            # Try to extract client_id from the page
-            content = response.text
-            patterns = [
-                r'client_id["\']?\s*[:=]\s*["\']([a-zA-Z0-9_-]+)["\']',
-                r'"client_id":"([a-zA-Z0-9_-]+)"',
-                r"client_id=([a-zA-Z0-9_-]+)",
+            # Find JavaScript bundle URLs
+            js_url_pattern = r'<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"'
+            js_urls = re.findall(js_url_pattern, html_content)
+            
+            # Also try to find client_id directly in HTML
+            html_patterns = [
+                r'client_id["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']',
+                r'"client_id":"([a-zA-Z0-9]{32,})"',
+                r'clientId["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']',
             ]
+            for pattern in html_patterns:
+                matches = re.findall(pattern, html_content, re.IGNORECASE)
+                found_ids.extend(matches)
             
-            for pattern in patterns:
-                match = re.search(pattern, content)
-                if match:
-                    self.client_id = match.group(1)
-                    return self.client_id
+            # Extract from JS bundles (limit to first 5 to avoid too many requests)
+            for js_url in js_urls[:5]:
+                try:
+                    js_response = await self.client.get(js_url, timeout=10)
+                    if js_response.status_code == 200:
+                        js_content = js_response.text
+                        # Look for client_id in JS (typically 32 chars)
+                        js_pattern = r'client_id["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']'
+                        matches = re.findall(js_pattern, js_content)
+                        found_ids.extend(matches)
+                except Exception:
+                    continue
             
-            # Fallback to known client IDs
-            self.client_id = self.CLIENT_IDS[0]
-            return self.client_id
+            # Remove duplicates and validate
+            unique_ids = []
+            seen = set()
+            for cid in found_ids:
+                if len(cid) >= 20 and cid not in seen:
+                    unique_ids.append(cid)
+                    seen.add(cid)
+            
+            return unique_ids
         except Exception:
-            # Fallback to known client IDs
-            self.client_id = self.CLIENT_IDS[0]
+            return []
+    
+    async def _test_client_id(self, client_id: str) -> bool:
+        """Test if a client_id is valid by making a simple API call."""
+        try:
+            # Use a known public track ID for testing
+            test_url = "https://api-v2.soundcloud.com/tracks"
+            params = {"ids": "13158665", "client_id": client_id}
+            # Use same headers as regular requests
+            response = await self.client.get(test_url, params=params, timeout=10)
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    async def get_client_id(self, force_refresh: bool = False) -> str:
+        """Extract and validate client ID from SoundCloud."""
+        if self.client_id and not force_refresh:
             return self.client_id
+        
+        # Try to extract from JS bundles first
+        extracted_ids = await self._extract_client_ids_from_js_bundles()
+        
+        # Combine with fallback IDs
+        all_candidates = extracted_ids + self.CLIENT_IDS
+        
+        # Test each candidate
+        for candidate_id in all_candidates:
+            if await self._test_client_id(candidate_id):
+                self.client_id = candidate_id
+                return self.client_id
+        
+        # If all fail, use first fallback (will likely fail but at least we tried)
+        self.client_id = self.CLIENT_IDS[0] if self.CLIENT_IDS else extracted_ids[0] if extracted_ids else None
+        if not self.client_id:
+            raise Exception("No valid client_id found")
+        return self.client_id
     
     async def resolve(self, url: str) -> Dict[str, Any]:
         """
         Resolve a SoundCloud URL - can be a track, playlist, or album.
         Returns the resolved object with its kind (track, playlist, album).
         """
-        client_id = await self.get_client_id()
-        
         resolve_url = "https://api-v2.soundcloud.com/resolve"
+        
+        # Try with current client_id first
+        client_id = await self.get_client_id()
         params = {
             "url": url,
             "client_id": client_id,
@@ -89,7 +144,23 @@ class SoundCloudClient:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise Exception(f"Failed to resolve URL: {e.response.status_code} - {e.response.text}")
+            # If we get 401, try refreshing client_id and retry
+            if e.response.status_code == 401:
+                # Clear cached client_id and get a fresh one
+                self.client_id = None
+                try:
+                    new_client_id = await self.get_client_id(force_refresh=True)
+                    params["client_id"] = new_client_id
+                    response = await self.client.get(resolve_url, params=params)
+                    response.raise_for_status()
+                    return response.json()
+                except Exception as retry_error:
+                    # If refresh also fails, raise original error with more context
+                    error_text = e.response.text[:200] if e.response.text else "No error details"
+                    raise Exception(f"Failed to resolve URL: 401 Unauthorized - Invalid client_id. {error_text}")
+            
+            error_text = e.response.text[:200] if e.response.text else "No error details"
+            raise Exception(f"Failed to resolve URL: {e.response.status_code} - {error_text}")
     
     async def _resolve_url(self, url: str) -> Dict[str, Any]:
         """Resolve a SoundCloud URL (alias for resolve method)."""
