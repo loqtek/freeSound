@@ -2,8 +2,9 @@
 
 import os
 import re
+import time
 import httpx
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 from utils.constants import BATCH_SIZE, HTTP_TIMEOUT, HTTP_MAX_CONNECTIONS, HTTP_MAX_KEEPALIVE_CONNECTIONS
 from utils.drm_detection import is_drm_protected_url
@@ -12,14 +13,15 @@ from utils.drm_detection import is_drm_protected_url
 class SoundCloudClient:
     """Client for interacting with SoundCloud API."""
     
-    # Common SoundCloud client IDs (these may need to be updated)
-    # These are used as fallback if client_id extraction from SoundCloud fails
-    CLIENT_IDS = [
-        "xXKzFLdhfXAtbaLbKFp4cNoiduLizuYO",
-        "LvWovRaZq8q5f1Z2K0t1Y7v5fJ8xK9pL",
-        "dH1Xed1fpITYonugor6sw39jvdq58M3h",
-        "02gUJC0hH2ct1EGOcYXQIzRFU91c72Ea",
-    ]
+    # SoundCloud web client IDs rotate; hardcoded values go stale quickly.
+    # Prefer SOUNDCLOUD_CLIENT_ID or live extraction from sndcdn bundles.
+    CLIENT_IDS: List[str] = []
+    
+    # Re-fetch client_id after this many seconds so cached IDs do not go stale mid-session.
+    CLIENT_ID_TTL_SECONDS = 45 * 60
+    
+    # Stable public URL used only to verify that a client_id works with /resolve (same as real API usage).
+    _VERIFY_RESOLVE_URL = "https://soundcloud.com/johnnycash"
     
     # User-Agent string for HTTP requests
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
@@ -42,6 +44,11 @@ class SoundCloudClient:
             limits=limits
         )
         self.client_id: Optional[str] = None
+        self._client_id_obtained_at: Optional[float] = None
+    
+    def _invalidate_client_id(self) -> None:
+        self.client_id = None
+        self._client_id_obtained_at = None
     
     async def _extract_client_ids_from_js_bundles(self) -> List[str]:
         """Extract client IDs from SoundCloud's JavaScript bundles (more reliable)."""
@@ -105,12 +112,10 @@ class SoundCloudClient:
                         js_content = js_response.text
                         # Look for client_id in JS with multiple patterns
                         js_patterns = [
-                            r'client_id["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']',
-                            r'clientId["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']',
-                            r'CLIENT_ID["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']',
-                            r'["\']([a-zA-Z0-9]{32})["\']',  # Generic 32-char strings (common client_id length)
-                            r'client_id:\s*["\']([a-zA-Z0-9]{32,})["\']',
-                            r'clientId:\s*["\']([a-zA-Z0-9]{32,})["\']',
+                            r'client_id:\s*["\']([a-zA-Z0-9]{32})["\']',
+                            r'client_id["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32})["\']',
+                            r'clientId["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32})["\']',
+                            r'CLIENT_ID["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32})["\']',
                         ]
                         for pattern in js_patterns:
                             matches = re.findall(pattern, js_content)
@@ -118,12 +123,11 @@ class SoundCloudClient:
                 except Exception:
                     continue
             
-            # Remove duplicates and validate (client_ids are typically 32 chars)
+            # Remove duplicates; SoundCloud web client_ids are 32 chars
             unique_ids = []
             seen = set()
             for cid in found_ids:
-                # SoundCloud client_ids are typically exactly 32 characters
-                if len(cid) >= 30 and len(cid) <= 35 and cid not in seen:
+                if len(cid) == 32 and cid not in seen:
                     unique_ids.append(cid)
                     seen.add(cid)
             
@@ -134,70 +138,89 @@ class SoundCloudClient:
             print(f"Warning: Failed to extract client IDs: {str(e)}")
             return []
     
-    async def _test_client_id(self, client_id: str) -> bool:
-        """Test if a client_id is valid by making a simple API call."""
+    async def _verify_client_id(self, client_id: str) -> bool:
+        """True if client_id works with /resolve (matches how we call the API for real URLs)."""
         try:
-            # Try multiple test endpoints to validate client_id
-            test_urls = [
-                ("https://api-v2.soundcloud.com/tracks", {"ids": "13158665", "client_id": client_id}),
-                ("https://api-v2.soundcloud.com/resolve", {"url": "https://soundcloud.com/johnnycash", "client_id": client_id}),
-            ]
-            
-            for test_url, params in test_urls:
-                try:
-                    response = await self.client.get(test_url, params=params, timeout=10)
-                    if response.status_code == 200:
-                        # Verify we got valid data
-                        data = response.json()
-                        if data and (isinstance(data, dict) or isinstance(data, list)):
-                            return True
-                except Exception:
-                    continue
-            return False
+            response = await self.client.get(
+                "https://api-v2.soundcloud.com/resolve",
+                params={"url": self._VERIFY_RESOLVE_URL, "client_id": client_id},
+                timeout=15,
+            )
+            if response.status_code != 200:
+                return False
+            data = response.json()
+            return isinstance(data, dict) and data.get("kind") in ("user", "track", "playlist")
         except Exception:
             return False
     
+    async def _collect_candidate_ids(self, exclude: Optional[Set[str]] = None) -> List[str]:
+        """Ordered list of client_id candidates: env, extracted bundles, optional static fallbacks."""
+        exclude = exclude or set()
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        def add(cid: Optional[str]) -> None:
+            if not cid or cid in exclude or cid in seen:
+                return
+            if len(cid) != 32:
+                return
+            seen.add(cid)
+            out.append(cid)
+
+        env_client_id = os.getenv("SOUNDCLOUD_CLIENT_ID")
+        if env_client_id:
+            add(env_client_id.strip())
+
+        extracted = await self._extract_client_ids_from_js_bundles()
+        for cid in extracted:
+            add(cid)
+        for cid in self.CLIENT_IDS:
+            add(cid)
+        return out
+
     async def get_client_id(self, force_refresh: bool = False) -> str:
         """Extract and validate client ID from SoundCloud."""
-        if self.client_id and not force_refresh:
+        now = time.time()
+        if (
+            self.client_id
+            and not force_refresh
+            and self._client_id_obtained_at is not None
+            and (now - self._client_id_obtained_at) < self.CLIENT_ID_TTL_SECONDS
+        ):
             return self.client_id
-        
-        # Check for manually set client_id from environment variable
+
+        if force_refresh:
+            self._invalidate_client_id()
+
         env_client_id = os.getenv("SOUNDCLOUD_CLIENT_ID")
         if env_client_id:
             print("Using client_id from SOUNDCLOUD_CLIENT_ID environment variable")
-            if await self._test_client_id(env_client_id):
-                self.client_id = env_client_id
+            eid = env_client_id.strip()
+            if len(eid) == 32 and await self._verify_client_id(eid):
+                self.client_id = eid
+                self._client_id_obtained_at = time.time()
                 return self.client_id
-            else:
-                print("Warning: Environment variable client_id is invalid, falling back to extraction")
-        
-        # Try to extract from JS bundles first
-        extracted_ids = await self._extract_client_ids_from_js_bundles()
-        
-        # Combine with fallback IDs (prioritize extracted ones)
-        all_candidates = extracted_ids + self.CLIENT_IDS
-        
+            print("Warning: SOUNDCLOUD_CLIENT_ID failed /resolve check, fetching from SoundCloud")
+
+        all_candidates = await self._collect_candidate_ids()
         if not all_candidates:
             raise Exception("No client_id candidates found. Unable to extract from SoundCloud.")
-        
-        # Test each candidate
+
         for candidate_id in all_candidates:
             try:
-                if await self._test_client_id(candidate_id):
+                if await self._verify_client_id(candidate_id):
                     self.client_id = candidate_id
+                    self._client_id_obtained_at = time.time()
                     print(f"Successfully validated client_id: {candidate_id[:8]}...")
                     return self.client_id
             except Exception as e:
-                print(f"Warning: Failed to test client_id {candidate_id[:8]}...: {str(e)}")
+                print(f"Warning: Failed to verify client_id {candidate_id[:8]}...: {str(e)}")
                 continue
-        
-        # If all fail, raise a more descriptive error
+
         raise Exception(
-            f"No valid client_id found. Tested {len(all_candidates)} candidates. "
-            "SoundCloud may have changed their API or the client IDs may be expired. "
-            "Please check if SoundCloud is accessible and try again. "
-            "You can also set SOUNDCLOUD_CLIENT_ID environment variable with a valid client_id."
+            f"No valid client_id found. Tested {len(all_candidates)} candidates against /resolve. "
+            "SoundCloud may have changed their site; ensure soundcloud.com is reachable. "
+            "You can set SOUNDCLOUD_CLIENT_ID to a current web client id from their JS bundles."
         )
     
     async def resolve(self, url: str) -> Dict[str, Any]:
@@ -206,62 +229,47 @@ class SoundCloudClient:
         Returns the resolved object with its kind (track, playlist, album).
         """
         resolve_url = "https://api-v2.soundcloud.com/resolve"
-        
-        # Try with current client_id first
+        tried: Set[str] = set()
+
+        async def fetch_resolved(cid: str) -> Optional[Dict[str, Any]]:
+            r = await self.client.get(resolve_url, params={"url": url, "client_id": cid})
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 401:
+                return None
+            error_text = r.text[:200] if r.text else "No error details"
+            raise Exception(f"Failed to resolve URL: {r.status_code} - {error_text}")
+
         try:
-            client_id = await self.get_client_id()
+            primary = await self.get_client_id()
+            if primary not in tried:
+                data = await fetch_resolved(primary)
+                if data is not None:
+                    return data
+                tried.add(primary)
+                print("Resolve returned 401; rotating client_id candidates...")
         except Exception as e:
-            # If we can't get a client_id, try to extract one more time
-            print(f"Warning: Failed to get client_id initially: {str(e)}")
-            self.client_id = None
-            client_id = await self.get_client_id(force_refresh=True)
-        
-        params = {
-            "url": url,
-            "client_id": client_id,
-        }
-        
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                response = await self.client.get(resolve_url, params=params)
-                response.raise_for_status()
-                return response.json()
-            except httpx.HTTPStatusError as e:
-                # If we get 401, try refreshing client_id and retry
-                if e.response.status_code == 401:
-                    if attempt < max_retries - 1:
-                        # Clear cached client_id and get a fresh one
-                        print(f"Got 401 error, refreshing client_id (attempt {attempt + 1}/{max_retries})...")
-                        self.client_id = None
-                        try:
-                            new_client_id = await self.get_client_id(force_refresh=True)
-                            params["client_id"] = new_client_id
-                            continue  # Retry with new client_id
-                        except Exception as refresh_error:
-                            print(f"Warning: Failed to refresh client_id: {str(refresh_error)}")
-                            # Try one more extraction attempt
-                            if attempt == 0:
-                                continue
-                    
-                    # If all retries failed, raise error with more context
-                    error_text = e.response.text[:200] if e.response.text else "No error details"
-                    raise Exception(
-                        f"Failed to resolve URL: 401 Unauthorized - Invalid client_id. "
-                        f"Tried {max_retries} times. {error_text}. "
-                        "SoundCloud may have changed their API authentication. "
-                        "Please try again in a few moments."
-                    )
-                
-                # For other HTTP errors, raise immediately
-                error_text = e.response.text[:200] if e.response.text else "No error details"
-                raise Exception(f"Failed to resolve URL: {e.response.status_code} - {error_text}")
-            except Exception as e:
-                # For non-HTTP errors, raise immediately
-                raise Exception(f"Failed to resolve URL: {str(e)}")
-        
-        # Should not reach here, but just in case
-        raise Exception("Failed to resolve URL after all retry attempts")
+            err = str(e)
+            if "No valid client_id" not in err and "No client_id candidates" not in err:
+                raise Exception(f"Failed to resolve URL: {err}") from e
+            print(f"Warning: {err}")
+
+        self._invalidate_client_id()
+
+        for cid in await self._collect_candidate_ids(exclude=tried):
+            tried.add(cid)
+            if not await self._verify_client_id(cid):
+                continue
+            data = await fetch_resolved(cid)
+            if data is not None:
+                self.client_id = cid
+                self._client_id_obtained_at = time.time()
+                return data
+
+        raise Exception(
+            "Failed to resolve URL: 401 Unauthorized - Invalid client_id. No error details. "
+            "Exhausted all client_id candidates from SoundCloud bundles; try again shortly."
+        )
     
     async def _resolve_url(self, url: str) -> Dict[str, Any]:
         """Resolve a SoundCloud URL (alias for resolve method)."""
@@ -272,7 +280,6 @@ class SoundCloudClient:
         if not track_ids:
             return {}
         
-        client_id = await self.get_client_id()
         all_tracks = {}
         
         try:
@@ -282,14 +289,22 @@ class SoundCloudClient:
                 ids_param = ",".join(str(tid) for tid in batch)
                 
                 tracks_url = "https://api-v2.soundcloud.com/tracks"
-                params = {
-                    "ids": ids_param,
-                    "client_id": client_id,
-                }
-                
-                response = await self.client.get(tracks_url, params=params)
-                response.raise_for_status()
-                tracks_data = response.json()
+                tracks_data = None
+                for attempt in range(1, 4):
+                    client_id = await self.get_client_id(force_refresh=(attempt > 1))
+                    params = {
+                        "ids": ids_param,
+                        "client_id": client_id,
+                    }
+                    response = await self.client.get(tracks_url, params=params)
+                    if response.status_code == 401:
+                        self._invalidate_client_id()
+                        continue
+                    response.raise_for_status()
+                    tracks_data = response.json()
+                    break
+                if tracks_data is None:
+                    continue
                 
                 # Handle response format
                 if isinstance(tracks_data, list):
@@ -425,8 +440,6 @@ class SoundCloudClient:
         else:
             track_data = url_or_data
         
-        client_id = await self.get_client_id()
-        
         # Extract track ID and media info
         track_id = track_data.get("id")
         media = track_data.get("media", {})
@@ -467,24 +480,30 @@ class SoundCloudClient:
         last_error = None
         for hls_transcoding in transcodings_to_try:
             try:
-                stream_url = hls_transcoding.get("url")
-                if not stream_url:
+                base_stream = hls_transcoding.get("url")
+                if not base_stream:
                     continue
                 
-                # Add client_id to the URL
-                if "?" in stream_url:
-                    stream_url += f"&client_id={client_id}"
-                else:
-                    stream_url += f"?client_id={client_id}"
-                
-                # Add track authorization if available
-                if track_authorization:
-                    stream_url += f"&track_authorization={track_authorization}"
-                
-                # Fetch the actual m3u8 URL
-                response = await self.client.get(stream_url)
-                response.raise_for_status()
-                stream_info = response.json()
+                stream_info = None
+                for auth_try in range(1, 5):
+                    client_id = await self.get_client_id(force_refresh=(auth_try > 1))
+                    stream_url = base_stream
+                    if "?" in stream_url:
+                        stream_url += f"&client_id={client_id}"
+                    else:
+                        stream_url += f"?client_id={client_id}"
+                    if track_authorization:
+                        stream_url += f"&track_authorization={track_authorization}"
+                    response = await self.client.get(stream_url)
+                    if response.status_code == 401:
+                        print("Stream step returned 401; rotating client_id...")
+                        self._invalidate_client_id()
+                        continue
+                    response.raise_for_status()
+                    stream_info = response.json()
+                    break
+                if stream_info is None:
+                    continue
                 
                 m3u8_url = stream_info.get("url")
                 if not m3u8_url:
@@ -516,6 +535,7 @@ class SoundCloudClient:
         
         # Try alternative method if all transcodings failed
         try:
+            client_id = await self.get_client_id()
             m3u8_url = await self._try_alternative_stream_url(
                 track_id,
                 track_authorization,
@@ -562,19 +582,28 @@ class SoundCloudClient:
         if not secret or not track_id:
             return None
         
-        media_url = f"https://api-v2.soundcloud.com/media/soundcloud:tracks:{track_id}/{secret}/stream/hls"
-        if track_authorization:
-            media_url += f"?client_id={client_id}&track_authorization={track_authorization}"
-        else:
-            media_url += f"?client_id={client_id}"
-        
-        try:
-            response = await self.client.get(media_url)
-            response.raise_for_status()
-            stream_info = response.json()
-            return stream_info.get("url")
-        except Exception:
-            return None
+        cid = client_id
+        for attempt in range(1, 4):
+            media_url = f"https://api-v2.soundcloud.com/media/soundcloud:tracks:{track_id}/{secret}/stream/hls"
+            if track_authorization:
+                media_url += f"?client_id={cid}&track_authorization={track_authorization}"
+            else:
+                media_url += f"?client_id={cid}"
+            try:
+                response = await self.client.get(media_url)
+                if response.status_code == 401:
+                    self._invalidate_client_id()
+                    cid = await self.get_client_id(force_refresh=True)
+                    continue
+                response.raise_for_status()
+                stream_info = response.json()
+                return stream_info.get("url")
+            except Exception:
+                if attempt < 3:
+                    self._invalidate_client_id()
+                    cid = await self.get_client_id(force_refresh=True)
+                continue
+        return None
     
     async def close(self):
         """Close the HTTP client."""
